@@ -97,6 +97,15 @@ img, video, canvas, svg, iframe { max-width: 100%; }
 }
 @keyframes pigRun{0%{left:-48px}100%{left:100%}}
 </style>
+
+<style id="elephant-progress-sync">
+.order-loading.show .pig-runner.elephant-runner{
+  animation:pigHop .28s ease-in-out infinite alternate !important;
+  left:0;
+  transition:left .35s ease !important;
+}
+</style>
+
 </head>
 <body>
   <main class="shell">
@@ -152,18 +161,18 @@ img, video, canvas, svg, iframe { max-width: 100%; }
       $('orderLoadingTitle').textContent=th?'กำลังส่งคำสั่งซื้อ':'正在送出訂單';
       $('orderLoadingText').textContent=th?'กรุณารอสักครู่ ระบบกำลังส่งคำสั่งซื้อและหลักฐานการชำระเงิน…':'請稍候，正在處理您的訂單與付款證明…';
       $('orderProgressText').textContent=th?'กำลังดำเนินการ…':'處理中…';
-      $('orderProgressBar').style.width='8%';
+      $('orderProgressBar').style.width='8%';$('pigRunner').style.left='calc(8% - 22px)';
       $('orderLoading').classList.add('show');
       $('orderLoading').setAttribute('aria-hidden','false');
       let p=8;
       clearInterval(orderProgressTimer);
       orderProgressTimer=setInterval(()=>{
-        if(p<88){p+=Math.max(1,Math.round((88-p)*.12));$('orderProgressBar').style.width=p+'%'}
+        if(p<88){p+=Math.max(1,Math.round((88-p)*.12));$('orderProgressBar').style.width=p+'%';$('pigRunner').style.left='calc('+p+'% - 22px)'}
       },350);
     }
     function finishOrderLoading(){
       clearInterval(orderProgressTimer);
-      $('orderProgressBar').style.width='100%';
+      $('orderProgressBar').style.width='100%';$('pigRunner').style.left='calc(100% - 44px)';
       $('orderProgressText').textContent=currentLang==='th'?'ส่งคำสั่งซื้อสำเร็จ ✓':'訂單送出成功 ✓';
     }
     function hideOrderLoading(){
