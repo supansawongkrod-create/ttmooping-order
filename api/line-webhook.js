@@ -5,70 +5,72 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const channelSecret = process.env.LINE_CHANNEL_SECRET;
+  const secret = process.env.LINE_CHANNEL_SECRET;
 
-  if (!channelSecret) {
-    console.error('LINE_CHANNEL_SECRET is missing');
-    return res.status(500).json({ error: 'Server configuration error' });
+  if (!secret) {
+    return res.status(500).json({ error: 'LINE_CHANNEL_SECRET missing' });
   }
 
   const signature = req.headers['x-line-signature'];
 
-  if (!signature) {
-    return res.status(401).json({ error: 'Missing LINE signature' });
+  const rawBody =
+    typeof req.body === 'string'
+      ? req.body
+      : JSON.stringify(req.body);
+
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(rawBody)
+    .digest('base64');
+
+  if (
+    !signature ||
+    signature.length !== expected.length ||
+    !crypto.timingSafeEqual(
+      Buffer.from(signature),
+      Buffer.from(expected)
+    )
+  ) {
+    return res.status(401).json({ error: 'Invalid signature' });
   }
 
-  try {
-    // Vercel may already parse application/json.
-    // Reconstruct the compact JSON body for LINE verification.
-    const rawBody =
-      typeof req.body === 'string'
-        ? req.body
-        : JSON.stringify(req.body);
+  const body =
+    typeof req.body === 'string'
+      ? JSON.parse(req.body)
+      : req.body;
 
-    const expectedSignature = crypto
-      .createHmac('sha256', channelSecret)
-      .update(rawBody)
-      .digest('base64');
+  for (const event of body.events || []) {
 
-    const signatureBuffer = Buffer.from(signature);
-    const expectedBuffer = Buffer.from(expectedSignature);
+    const userId = event?.source?.userId;
+
+    if (!userId) continue;
+
+    console.log('LINE_USER_ID:', userId);
+    console.log('EVENT_TYPE:', event.type);
+
+    /*
+      เมื่อผู้ใช้ส่งข้อความว่า "order" หรือ "สั่งซื้อ"
+      เราจะตอบกลับพร้อมลิงก์ Order
+
+      ขั้นถัดไปเราจะเปลี่ยนลิงก์นี้ให้มี session token
+      ที่ผูกกับ LINE user อย่างปลอดภัย
+    */
 
     if (
-      signatureBuffer.length !== expectedBuffer.length ||
-      !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)
+      event.type === 'message' &&
+      event.message?.type === 'text'
     ) {
-      console.error('Invalid LINE signature');
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
+      const text = event.message.text.trim().toLowerCase();
 
-    const body =
-      typeof req.body === 'string'
-        ? JSON.parse(req.body)
-        : req.body;
-
-    const events = body?.events || [];
-
-    // LINE sends events: [] when verifying the webhook URL.
-    if (events.length === 0) {
-      console.log('LINE webhook verification received');
-      return res.status(200).json({ success: true });
-    }
-
-    for (const event of events) {
-      const userId = event?.source?.userId;
-
-      if (userId) {
-        // Temporary: use Vercel Logs to confirm our own test user ID.
-        console.log('LINE_USER_ID:', userId);
-        console.log('EVENT_TYPE:', event.type);
+      if (
+        text === 'order' ||
+        text === 'สั่งซื้อ' ||
+        text === '訂購'
+      ) {
+        console.log('ORDER_REQUEST_FROM:', userId);
       }
     }
-
-    return res.status(200).json({ success: true });
-
-  } catch (error) {
-    console.error('Webhook error:', error);
-    return res.status(500).json({ error: 'Webhook error' });
   }
+
+  return res.status(200).json({ success: true });
 };
