@@ -10,7 +10,8 @@ const SESSION_MAX_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours
 const MAX_REQUEST_BYTES = 2.8 * 1024 * 1024;
 
 module.exports = async function handler(req, res) {
-  // Don't cache responses containing order state
+  const totalStart = Date.now();
+
   res.setHeader('Cache-Control', 'no-store');
 
   if (req.method !== 'POST') {
@@ -21,18 +22,26 @@ module.exports = async function handler(req, res) {
   }
 
   try {
+    // ==================================================
+    // 0. SERVER CONFIG
+    // ==================================================
+
     if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
-      throw new Error('Server configuration error');
+      throw new Error('Supabase configuration missing');
     }
 
     if (!LINE_CHANNEL_ID || !LINE_CHANNEL_SECRET) {
-      throw new Error('Server configuration error');
+      throw new Error('LINE configuration missing');
     }
 
-    // Basic payload-size protection
-    const contentLength = Number(req.headers['content-length'] || 0);
+    const contentLength = Number(
+      req.headers['content-length'] || 0
+    );
 
-    if (contentLength && contentLength > MAX_REQUEST_BYTES) {
+    if (
+      contentLength &&
+      contentLength > MAX_REQUEST_BYTES
+    ) {
       return res.status(413).json({
         success: false,
         error: 'Payment image is too large'
@@ -68,26 +77,35 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --------------------------------------------------
-    // 1. Resolve session server-side
-    // Never accept LINE userId from the browser.
-    // --------------------------------------------------
+    // ==================================================
+    // 1. SESSION LOOKUP
+    // ==================================================
+
+    const sessionStart = Date.now();
 
     const sessionResponse = await fetch(
       `${SUPABASE_URL}/rest/v1/order_sessions` +
-      `?token=eq.${encodeURIComponent(session)}` +
-      `&select=token,line_user_id,created_at,used&limit=1`,
+        `?token=eq.${encodeURIComponent(session)}` +
+        `&select=token,line_user_id,created_at,used&limit=1`,
       {
         headers: supabaseHeaders()
       }
     );
 
     if (!sessionResponse.ok) {
-      throw new Error('Session lookup failed');
+      throw new Error(
+        `Session lookup HTTP ${sessionResponse.status}`
+      );
     }
 
-    const rows = await sessionResponse.json();
-    const orderSession = rows[0];
+    const sessions = await sessionResponse.json();
+    const orderSession = sessions[0];
+
+    console.log(
+      `[TIMING] Session lookup: ${
+        Date.now() - sessionStart
+      } ms`
+    );
 
     if (!orderSession) {
       return res.status(401).json({
@@ -110,8 +128,11 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const createdAt = new Date(orderSession.created_at).getTime();
-    const age = Date.now() - createdAt;
+    const createdAt =
+      new Date(orderSession.created_at).getTime();
+
+    const age =
+      Date.now() - createdAt;
 
     if (
       !Number.isFinite(createdAt) ||
@@ -124,10 +145,9 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --------------------------------------------------
-    // 2. Prepare order
-    // Keep existing shop/payment workflow.
-    // --------------------------------------------------
+    // ==================================================
+    // 2. PREPARE SAFE ORDER PAYLOAD
+    // ==================================================
 
     const safePayload = {
       action: 'createOrder',
@@ -152,11 +172,17 @@ module.exports = async function handler(req, res) {
           ? 'linepay'
           : 'bank',
 
-      productTotal: numberOrZero(data.productTotal),
-      shippingFee: numberOrZero(data.shippingFee),
-      total: numberOrZero(data.total),
+      productTotal:
+        numberOrZero(data.productTotal),
 
-      slip: String(data.slip || '')
+      shippingFee:
+        numberOrZero(data.shippingFee),
+
+      total:
+        numberOrZero(data.total),
+
+      slip:
+        String(data.slip || '')
     };
 
     if (
@@ -170,7 +196,6 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // Only accept image data URLs.
     if (
       !/^data:image\/(jpeg|jpg|png|webp);base64,/i.test(
         safePayload.slip
@@ -182,9 +207,11 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --------------------------------------------------
-    // 3. Save order through existing Apps Script
-    // --------------------------------------------------
+    // ==================================================
+    // 3. APPS SCRIPT + DRIVE + SHEET
+    // ==================================================
+
+    const appsScriptStart = Date.now();
 
     const orderResponse = await fetch(
       ORDER_APPS_SCRIPT,
@@ -192,54 +219,70 @@ module.exports = async function handler(req, res) {
         method: 'POST',
 
         headers: {
-          'Content-Type': 'text/plain;charset=utf-8'
+          'Content-Type':
+            'text/plain;charset=utf-8'
         },
 
-        body: JSON.stringify(safePayload),
+        body:
+          JSON.stringify(safePayload),
 
         redirect: 'follow'
       }
     );
 
-    const orderText = await orderResponse.text();
+    const orderText =
+      await orderResponse.text();
 
-    let orderResult;
+    console.log(
+      `[TIMING] Apps Script + Drive + Sheet: ${
+        Date.now() - appsScriptStart
+      } ms`
+    );
+
+    let orderResult = null;
 
     try {
-      orderResult = JSON.parse(orderText);
-    } catch (_) {
-      orderResult = null;
-    }
+      orderResult =
+        JSON.parse(orderText);
+    } catch (_) {}
 
     if (
       !orderResponse.ok ||
       !orderResult ||
       orderResult.success !== true
     ) {
-      // Do not log customer payload/slip.
       console.error(
         'Order backend failed:',
         orderResponse.status
       );
 
-      throw new Error('Order could not be saved');
+      throw new Error(
+        'Order could not be saved'
+      );
     }
 
-    // --------------------------------------------------
-    // 4. Consume session
-    // --------------------------------------------------
+    // ==================================================
+    // 4. MARK SESSION AS USED
+    // ==================================================
+
+    const sessionUpdateStart =
+      Date.now();
 
     const usedResponse = await fetch(
       `${SUPABASE_URL}/rest/v1/order_sessions` +
-      `?token=eq.${encodeURIComponent(session)}` +
-      `&used=eq.false`,
+        `?token=eq.${encodeURIComponent(session)}` +
+        `&used=eq.false`,
       {
         method: 'PATCH',
 
         headers: {
           ...supabaseHeaders(),
-          'Content-Type': 'application/json',
-          Prefer: 'return=minimal'
+
+          'Content-Type':
+            'application/json',
+
+          Prefer:
+            'return=minimal'
         },
 
         body: JSON.stringify({
@@ -248,70 +291,186 @@ module.exports = async function handler(req, res) {
       }
     );
 
+    console.log(
+      `[TIMING] Session update: ${
+        Date.now() - sessionUpdateStart
+      } ms`
+    );
+
     if (!usedResponse.ok) {
       /*
-        Order is already safely stored.
-        Don't ask the customer to submit the order again.
+        Order is already saved.
+        Don't expose customer data
+        and don't ask them to submit again.
       */
+
       console.error(
-        'Session cleanup failed:',
+        'Session update failed:',
         usedResponse.status
       );
     }
 
-    // --------------------------------------------------
-    // 5. Return success immediately
+    // ==================================================
+    // 5. LINE CONFIRMATION
     //
-    // LINE notification is triggered asynchronously.
-    // Customer doesn't need to wait for LINE API.
-    // --------------------------------------------------
+    // IMPORTANT:
+    // Wait for LINE before returning response.
+    // This prevents Vercel from terminating the
+    // function before the message is sent.
+    // ==================================================
 
-    res.status(200).json({
-      success: true,
-      orderId: orderId
-    });
+    const lineStart = Date.now();
 
-    // Continue best-effort notification.
-    // No customer PII is written to logs.
-    sendLineConfirmation(
-      orderSession.line_user_id,
-      safePayload
-    ).catch((error) => {
-      console.error(
-        'LINE notification failed:',
-        String(error?.message || 'unknown')
+    let lineSent = false;
+
+    try {
+      const accessToken =
+        await getLineAccessToken();
+
+      await pushOrderConfirmation(
+        accessToken,
+        orderSession.line_user_id,
+        safePayload
       );
+
+      lineSent = true;
+
+      console.log(
+        `[TIMING] LINE: ${
+          Date.now() - lineStart
+        } ms`
+      );
+
+    } catch (lineError) {
+      /*
+        Order has already been saved.
+        LINE failure must NOT cause customer
+        to submit the order again.
+      */
+
+      console.error(
+        'LINE confirmation failed:',
+        String(
+          lineError?.message ||
+          'unknown'
+        )
+      );
+
+      console.log(
+        `[TIMING] LINE failed after: ${
+          Date.now() - lineStart
+        } ms`
+      );
+    }
+
+    // ==================================================
+    // 6. FINISH
+    // ==================================================
+
+    console.log(
+      `[TIMING] TOTAL: ${
+        Date.now() - totalStart
+      } ms`
+    );
+
+    return res.status(200).json({
+      success: true,
+      orderId: orderId,
+      lineSent: lineSent
     });
 
   } catch (error) {
-    // Do NOT dump request body, address, phone or slip.
+
     console.error(
       'Order submit error:',
-      String(error?.message || 'unknown')
+      String(
+        error?.message ||
+        'unknown'
+      )
+    );
+
+    console.log(
+      `[TIMING] FAILED TOTAL: ${
+        Date.now() - totalStart
+      } ms`
     );
 
     return res.status(500).json({
       success: false,
-      error: 'Unable to submit order. Please try again.'
+      error:
+        'Unable to submit order. Please try again.'
     });
   }
 };
 
 
-// =====================================================
-// LINE
-// =====================================================
+// ======================================================
+// LINE ACCESS TOKEN
+// ======================================================
 
-async function sendLineConfirmation(userId, data) {
-  const accessToken = await getLineAccessToken();
+async function getLineAccessToken() {
+  const params =
+    new URLSearchParams({
+      grant_type:
+        'client_credentials',
 
+      client_id:
+        LINE_CHANNEL_ID,
+
+      client_secret:
+        LINE_CHANNEL_SECRET
+    });
+
+  const response =
+    await fetch(
+      'https://api.line.me/v2/oauth/accessToken',
+      {
+        method: 'POST',
+
+        headers: {
+          'Content-Type':
+            'application/x-www-form-urlencoded'
+        },
+
+        body:
+          params.toString()
+      }
+    );
+
+  const result =
+    await response.json();
+
+  if (
+    !response.ok ||
+    !result.access_token
+  ) {
+    throw new Error(
+      `LINE token HTTP ${response.status}`
+    );
+  }
+
+  return result.access_token;
+}
+
+
+// ======================================================
+// LINE PUSH
+// ======================================================
+
+async function pushOrderConfirmation(
+  accessToken,
+  userId,
+  data
+) {
   const delivery =
     data.delivery === 'shipping'
       ? '黑貓冷凍宅配'
       : '台中工作室自取';
 
   const total =
-    Number(data.total || 0).toLocaleString('en-US');
+    Number(
+      data.total || 0
+    ).toLocaleString('en-US');
 
   const text =
     `🐘 泰泰烤豬串\n\n` +
@@ -322,27 +481,33 @@ async function sendLineConfirmation(userId, data) {
     `付款證明已收到，店家核對款項後訂單才會正式成立。\n` +
     `感謝您的訂購 ❤️`;
 
-  const response = await fetch(
-    'https://api.line.me/v2/bot/message/push',
-    {
-      method: 'POST',
+  const response =
+    await fetch(
+      'https://api.line.me/v2/bot/message/push',
+      {
+        method: 'POST',
 
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      },
+        headers: {
+          Authorization:
+            `Bearer ${accessToken}`,
 
-      body: JSON.stringify({
-        to: userId,
-        messages: [
-          {
-            type: 'text',
-            text: text
-          }
-        ]
-      })
-    }
-  );
+          'Content-Type':
+            'application/json'
+        },
+
+        body:
+          JSON.stringify({
+            to: userId,
+
+            messages: [
+              {
+                type: 'text',
+                text: text
+              }
+            ]
+          })
+      }
+    );
 
   if (!response.ok) {
     throw new Error(
@@ -352,64 +517,43 @@ async function sendLineConfirmation(userId, data) {
 }
 
 
-async function getLineAccessToken() {
-  const params = new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: LINE_CHANNEL_ID,
-    client_secret: LINE_CHANNEL_SECRET
-  });
-
-  const response = await fetch(
-    'https://api.line.me/v2/oauth/accessToken',
-    {
-      method: 'POST',
-
-      headers: {
-        'Content-Type':
-          'application/x-www-form-urlencoded'
-      },
-
-      body: params.toString()
-    }
-  );
-
-  const result = await response.json();
-
-  if (!response.ok || !result.access_token) {
-    throw new Error(
-      `LINE token HTTP ${response.status}`
-    );
-  }
-
-  return result.access_token;
-}
-
-
-// =====================================================
+// ======================================================
 // HELPERS
-// =====================================================
+// ======================================================
 
 function supabaseHeaders() {
   return {
-    apikey: SUPABASE_SECRET_KEY,
-    Authorization: `Bearer ${SUPABASE_SECRET_KEY}`
+    apikey:
+      SUPABASE_SECRET_KEY,
+
+    Authorization:
+      `Bearer ${SUPABASE_SECRET_KEY}`
   };
 }
 
 
-function clean(value, maxLength) {
-  return String(value == null ? '' : value)
+function clean(
+  value,
+  maxLength
+) {
+  return String(
+    value == null
+      ? ''
+      : value
+  )
     .trim()
-    .slice(0, maxLength);
+    .slice(
+      0,
+      maxLength
+    );
 }
 
 
 function numberOrZero(value) {
-  const number = Number(value);
+  const number =
+    Number(value);
 
-  if (!Number.isFinite(number)) {
-    return 0;
-  }
-
-  return number;
+  return Number.isFinite(number)
+    ? number
+    : 0;
 }
