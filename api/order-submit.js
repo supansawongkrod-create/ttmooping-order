@@ -34,7 +34,7 @@ module.exports = async function handler(req, res) {
   try {
 
     // ==================================================
-    // 0. SERVER CONFIG
+    // 0. CONFIG
     // ==================================================
 
     if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
@@ -129,8 +129,7 @@ module.exports = async function handler(req, res) {
     const createdAt =
       new Date(orderSession.created_at).getTime();
 
-    const age =
-      Date.now() - createdAt;
+    const age = Date.now() - createdAt;
 
     if (
       !Number.isFinite(createdAt) ||
@@ -250,7 +249,7 @@ module.exports = async function handler(req, res) {
 
 
     // ==================================================
-    // 4. STORE SLIP IN PRIVATE SUPABASE STORAGE
+    // 4. SAVE SLIP TO PRIVATE STORAGE
     // ==================================================
 
     const storageStart = Date.now();
@@ -284,6 +283,7 @@ module.exports = async function handler(req, res) {
     );
 
     if (!uploadResponse.ok) {
+
       const uploadError =
         await uploadResponse.text();
 
@@ -306,7 +306,9 @@ module.exports = async function handler(req, res) {
 
 
     // ==================================================
-    // 5. SAVE ORDER IN SUPABASE
+    // 5. SAVE ORDER TO SUPABASE
+    //
+    // Once this succeeds, the order is safely stored.
     // ==================================================
 
     const databaseStart = Date.now();
@@ -376,6 +378,7 @@ module.exports = async function handler(req, res) {
     );
 
     if (!databaseResponse.ok) {
+
       const databaseError =
         await databaseResponse.text();
 
@@ -409,48 +412,15 @@ module.exports = async function handler(req, res) {
 
 
     // ==================================================
-    // 6. MARK SESSION USED
-    // ==================================================
-
-    const sessionUpdateStart = Date.now();
-
-    const usedResponse = await fetch(
-      `${SUPABASE_URL}/rest/v1/order_sessions` +
-      `?token=eq.${encodeURIComponent(session)}` +
-      `&used=eq.false`,
-      {
-        method: 'PATCH',
-
-        headers: {
-          ...supabaseHeaders(),
-
-          'Content-Type': 'application/json',
-
-          Prefer: 'return=minimal'
-        },
-
-        body: JSON.stringify({
-          used: true
-        })
-      }
-    );
-
-    console.log(
-      `[TIMING] Session update: ${
-        Date.now() - sessionUpdateStart
-      } ms`
-    );
-
-    if (!usedResponse.ok) {
-      console.error(
-        'Session update failed:',
-        usedResponse.status
-      );
-    }
-
-
-    // ==================================================
-    // 7. BACKGROUND
+    // 6. BACKGROUND
+    //
+    // IMPORTANT:
+    // Browser does NOT wait for:
+    // - Google
+    // - LINE
+    // - session update
+    //
+    // These 3 start concurrently.
     // ==================================================
 
     waitUntil(
@@ -465,13 +435,15 @@ module.exports = async function handler(req, res) {
 
         slipPath,
 
-        mimeType
+        mimeType,
+
+        session
       })
     );
 
 
     // ==================================================
-    // 8. CUSTOMER RESPONSE
+    // 7. CUSTOMER RESPONSE
     // ==================================================
 
     console.log(
@@ -482,7 +454,7 @@ module.exports = async function handler(req, res) {
 
     return res.status(200).json({
       success: true,
-      orderId: orderId
+      orderId
     });
 
 
@@ -512,7 +484,7 @@ module.exports = async function handler(req, res) {
 
 
 // ======================================================
-// BACKGROUND PROCESSING
+// BACKGROUND
 // ======================================================
 
 async function processOrderInBackground({
@@ -520,166 +492,73 @@ async function processOrderInBackground({
   lineUserId,
   payload,
   slipPath,
-  mimeType
+  mimeType,
+  session
 }) {
   const start = Date.now();
 
-  let sheetSuccess = false;
-  let lineSuccess = false;
+  /*
+    Google, LINE and session update start
+    at the same time.
+  */
+
+  const results =
+    await Promise.allSettled([
+
+      syncGoogleOrder({
+        payload,
+        slipPath,
+        mimeType
+      }),
+
+      sendLineOrderConfirmation(
+        lineUserId,
+        payload
+      ),
+
+      markSessionUsed(
+        session
+      )
+    ]);
+
+
+  const googleResult = results[0];
+  const lineResult = results[1];
+  const sessionResult = results[2];
 
 
   // ====================================================
-  // A. GOOGLE SHEET + DRIVE
-  //
-  // IMPORTANT:
-  // Google failure does NOT stop LINE.
+  // GOOGLE RESULT
   // ====================================================
 
-  try {
+  const sheetSuccess =
+    googleResult.status === 'fulfilled';
 
-    const googleStart = Date.now();
-
-    const downloadResponse = await fetch(
-      `${SUPABASE_URL}/storage/v1/object/authenticated/` +
-      `${STORAGE_BUCKET}/` +
-      `${encodeURIComponent(slipPath)}`,
-      {
-        headers: supabaseHeaders()
-      }
-    );
-
-    if (!downloadResponse.ok) {
-      const downloadError =
-        await downloadResponse.text();
-
-      throw new Error(
-        `Storage download HTTP ${downloadResponse.status}: ` +
-        downloadError.slice(0, 300)
-      );
-    }
-
-    const imageBuffer =
-      Buffer.from(
-        await downloadResponse.arrayBuffer()
-      );
-
-    const slipDataUrl =
-      `data:${mimeType};base64,` +
-      imageBuffer.toString('base64');
-
-    const appsPayload = {
-      ...payload,
-      slip: slipDataUrl
-    };
-
-    const orderResponse = await fetch(
-      ORDER_APPS_SCRIPT,
-      {
-        method: 'POST',
-
-        headers: {
-          'Content-Type':
-            'text/plain;charset=utf-8'
-        },
-
-        body:
-          JSON.stringify(appsPayload),
-
-        redirect: 'follow'
-      }
-    );
-
-    const orderText =
-      await orderResponse.text();
-
-    let orderResult = null;
-
-    try {
-      orderResult =
-        JSON.parse(orderText);
-    } catch (_) {}
-
-    if (
-      !orderResponse.ok ||
-      !orderResult ||
-      orderResult.success !== true
-    ) {
-
-      const googleMessage =
-        orderResult &&
-        orderResult.message
-
-          ? String(
-              orderResult.message
-            ).slice(0, 300)
-
-          : 'Invalid Apps Script response';
-
-      throw new Error(
-        `Google order failed - HTTP ${orderResponse.status} - ${googleMessage}`
-      );
-    }
-
-    sheetSuccess = true;
-
-    console.log(
-      `[BACKGROUND] Google Sheet + Drive: ${
-        Date.now() - googleStart
-      } ms`
-    );
-
-  } catch (googleError) {
+  if (!sheetSuccess) {
 
     console.error(
       '[BACKGROUND] GOOGLE FAILED:',
       String(
-        googleError?.message ||
+        googleResult.reason?.message ||
         'unknown'
       )
     );
-
-    /*
-      Do NOT delete the temporary slip.
-
-      Order and slip stay safely in Supabase
-      so they can be recovered/retried.
-    */
   }
 
 
   // ====================================================
-  // B. LINE
-  //
-  // LINE runs regardless of Google result.
+  // LINE RESULT
   // ====================================================
 
-  try {
+  const lineSuccess =
+    lineResult.status === 'fulfilled';
 
-    const lineStart = Date.now();
-
-    const accessToken =
-      await getLineAccessToken();
-
-    await pushOrderConfirmation(
-      accessToken,
-      lineUserId,
-      payload
-    );
-
-    lineSuccess = true;
-
-    console.log(
-      `[BACKGROUND] LINE: ${
-        Date.now() - lineStart
-      } ms`
-    );
-
-  } catch (lineError) {
+  if (!lineSuccess) {
 
     console.error(
       '[BACKGROUND] LINE FAILED:',
       String(
-        lineError?.message ||
+        lineResult.reason?.message ||
         'unknown'
       )
     );
@@ -687,7 +566,25 @@ async function processOrderInBackground({
 
 
   // ====================================================
-  // C. UPDATE STATUS
+  // SESSION RESULT
+  // ====================================================
+
+  if (
+    sessionResult.status === 'rejected'
+  ) {
+
+    console.error(
+      '[BACKGROUND] SESSION UPDATE FAILED:',
+      String(
+        sessionResult.reason?.message ||
+        'unknown'
+      )
+    );
+  }
+
+
+  // ====================================================
+  // UPDATE ORDER STATUS
   // ====================================================
 
   try {
@@ -703,12 +600,12 @@ async function processOrderInBackground({
       }
     );
 
-  } catch (statusError) {
+  } catch (error) {
 
     console.error(
       '[BACKGROUND] STATUS UPDATE FAILED:',
       String(
-        statusError?.message ||
+        error?.message ||
         'unknown'
       )
     );
@@ -716,9 +613,9 @@ async function processOrderInBackground({
 
 
   // ====================================================
-  // D. DELETE TEMP STORAGE COPY
+  // CLEAN TEMP STORAGE
   //
-  // Only after Google successfully saved the slip.
+  // Only delete Supabase copy if Google succeeded.
   // ====================================================
 
   if (sheetSuccess) {
@@ -735,18 +632,17 @@ async function processOrderInBackground({
         await updateOrderStatus(
           orderId,
           {
-            slip_path:
-              null
+            slip_path: null
           }
         );
       }
 
-    } catch (cleanupError) {
+    } catch (error) {
 
       console.error(
         '[BACKGROUND] STORAGE CLEANUP FAILED:',
         String(
-          cleanupError?.message ||
+          error?.message ||
           'unknown'
         )
       );
@@ -759,6 +655,195 @@ async function processOrderInBackground({
       Date.now() - start
     } ms | sheet=${sheetSuccess} | line=${lineSuccess}`
   );
+}
+
+
+// ======================================================
+// GOOGLE
+// ======================================================
+
+async function syncGoogleOrder({
+  payload,
+  slipPath,
+  mimeType
+}) {
+  const start = Date.now();
+
+  // Download temporary private slip
+
+  const downloadResponse = await fetch(
+    `${SUPABASE_URL}/storage/v1/object/authenticated/` +
+    `${STORAGE_BUCKET}/` +
+    `${encodeURIComponent(slipPath)}`,
+    {
+      headers:
+        supabaseHeaders()
+    }
+  );
+
+  if (!downloadResponse.ok) {
+
+    const errorText =
+      await downloadResponse.text();
+
+    throw new Error(
+      `Storage download HTTP ${downloadResponse.status}: ` +
+      errorText.slice(0, 300)
+    );
+  }
+
+  const imageBuffer =
+    Buffer.from(
+      await downloadResponse.arrayBuffer()
+    );
+
+  const slipDataUrl =
+    `data:${mimeType};base64,` +
+    imageBuffer.toString('base64');
+
+
+  // Send to Apps Script
+
+  const appsPayload = {
+    ...payload,
+    slip: slipDataUrl
+  };
+
+  const orderResponse = await fetch(
+    ORDER_APPS_SCRIPT,
+    {
+      method: 'POST',
+
+      headers: {
+        'Content-Type':
+          'text/plain;charset=utf-8'
+      },
+
+      body:
+        JSON.stringify(appsPayload),
+
+      redirect:
+        'follow'
+    }
+  );
+
+  const orderText =
+    await orderResponse.text();
+
+  let orderResult = null;
+
+  try {
+    orderResult =
+      JSON.parse(orderText);
+  } catch (_) {}
+
+
+  if (
+    !orderResponse.ok ||
+    !orderResult ||
+    orderResult.success !== true
+  ) {
+
+    const message =
+      orderResult &&
+      orderResult.message
+
+        ? String(
+            orderResult.message
+          ).slice(0, 300)
+
+        : 'Invalid Apps Script response';
+
+    throw new Error(
+      `Google order failed - HTTP ${orderResponse.status} - ${message}`
+    );
+  }
+
+
+  console.log(
+    `[BACKGROUND] Google Sheet + Drive: ${
+      Date.now() - start
+    } ms`
+  );
+
+  return true;
+}
+
+
+// ======================================================
+// LINE BACKGROUND JOB
+// ======================================================
+
+async function sendLineOrderConfirmation(
+  lineUserId,
+  payload
+) {
+  const start = Date.now();
+
+  const accessToken =
+    await getLineAccessToken();
+
+  await pushOrderConfirmation(
+    accessToken,
+    lineUserId,
+    payload
+  );
+
+  console.log(
+    `[BACKGROUND] LINE: ${
+      Date.now() - start
+    } ms`
+  );
+
+  return true;
+}
+
+
+// ======================================================
+// SESSION BACKGROUND JOB
+// ======================================================
+
+async function markSessionUsed(
+  session
+) {
+  const start = Date.now();
+
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/order_sessions` +
+    `?token=eq.${encodeURIComponent(session)}` +
+    `&used=eq.false`,
+    {
+      method: 'PATCH',
+
+      headers: {
+        ...supabaseHeaders(),
+
+        'Content-Type':
+          'application/json',
+
+        Prefer:
+          'return=minimal'
+      },
+
+      body: JSON.stringify({
+        used: true
+      })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Session update HTTP ${response.status}`
+    );
+  }
+
+  console.log(
+    `[BACKGROUND] Session update: ${
+      Date.now() - start
+    } ms`
+  );
+
+  return true;
 }
 
 
@@ -800,7 +885,7 @@ async function updateOrderStatus(
 
 
 // ======================================================
-// DELETE TEMPORARY STORAGE FILE
+// STORAGE DELETE
 // ======================================================
 
 async function deleteStorageFile(
@@ -833,7 +918,7 @@ async function deleteStorageFile(
 
 
 // ======================================================
-// LINE ACCESS TOKEN
+// LINE TOKEN
 // ======================================================
 
 async function getLineAccessToken() {
@@ -881,7 +966,7 @@ async function getLineAccessToken() {
 
 
 // ======================================================
-// LINE CONFIRMATION
+// LINE PUSH
 // ======================================================
 
 async function pushOrderConfirmation(
@@ -936,12 +1021,12 @@ async function pushOrderConfirmation(
 
   if (!response.ok) {
 
-    const lineError =
+    const errorText =
       await response.text();
 
     throw new Error(
       `LINE push HTTP ${response.status}: ` +
-      lineError.slice(0, 300)
+      errorText.slice(0, 300)
     );
   }
 }
