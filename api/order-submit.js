@@ -1,28 +1,12 @@
-const { waitUntil } = require('@vercel/functions');
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
-
-const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID;
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-
 const ORDER_APPS_SCRIPT =
+  process.env.ORDER_APPS_SCRIPT_URL ||
   'https://script.google.com/macros/s/AKfycbxAgWawSRlh1PsoVEX5UoU-btb0Ia5pKCMWDNYBq5RzBZJ472PO5MNi7IDLwrrFZzwG/exec';
 
-const STORAGE_BUCKET = 'payment-slips';
-
-const SESSION_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const MAX_REQUEST_BYTES = 2.8 * 1024 * 1024;
 const MAX_SLIP_BYTES = 1.9 * 1024 * 1024;
 
-
-// ======================================================
-// MAIN
-// ======================================================
-
 module.exports = async function handler(req, res) {
-  const totalStart = Date.now();
-
-  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
 
   if (req.method !== 'POST') {
     return res.status(405).json({
@@ -32,17 +16,15 @@ module.exports = async function handler(req, res) {
   }
 
   try {
+    const contentLength = Number(
+      req.headers['content-length'] || 0
+    );
 
-    // ==================================================
-    // 0. CONFIG
-    // ==================================================
-
-    if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
-      throw new Error('Supabase configuration missing');
-    }
-
-    if (!LINE_CHANNEL_ID || !LINE_CHANNEL_SECRET) {
-      throw new Error('LINE configuration missing');
+    if (contentLength > MAX_REQUEST_BYTES) {
+      return res.status(413).json({
+        success: false,
+        error: 'Request is too large'
+      });
     }
 
     const data =
@@ -50,169 +32,78 @@ module.exports = async function handler(req, res) {
         ? JSON.parse(req.body)
         : req.body;
 
-    if (!data || typeof data !== 'object') {
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      data.action !== 'createOrder'
+    ) {
       return res.status(400).json({
         success: false,
         error: 'Invalid request'
       });
     }
 
-    const session = clean(data.session, 200);
     const orderId = clean(data.orderId, 100);
+    const lineName = clean(data.lineName, 100);
+    const name = clean(data.name, 100);
 
-    if (!session) {
+    const phone = clean(data.phone, 40)
+      .replace(/\D/g, '');
+
+    const address = clean(data.address, 500);
+    const pork = wholeNumber(data.pork, 0, 100);
+    const chicken = wholeNumber(data.chicken, 0, 100);
+
+    const delivery =
+      data.delivery === 'pickup'
+        ? 'pickup'
+        : 'shipping';
+
+    const payment =
+      data.payment === 'linepay'
+        ? 'linepay'
+        : 'bank';
+
+    const slip = String(data.slip || '');
+
+    if (!/^TT\d{10}$/.test(orderId)) {
       return res.status(400).json({
         success: false,
-        error: 'Missing order session'
+        error: 'Invalid order ID'
       });
     }
-
-    if (!orderId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing order ID'
-      });
-    }
-
-
-    // ==================================================
-    // 1. CHECK SESSION
-    // ==================================================
-
-    const sessionStart = Date.now();
-
-    const sessionResponse = await fetch(
-      `${SUPABASE_URL}/rest/v1/order_sessions` +
-      `?token=eq.${encodeURIComponent(session)}` +
-      `&select=token,line_user_id,created_at,used&limit=1`,
-      {
-        headers: supabaseHeaders()
-      }
-    );
-
-    if (!sessionResponse.ok) {
-      throw new Error(
-        `Session lookup HTTP ${sessionResponse.status}`
-      );
-    }
-
-    const sessions = await sessionResponse.json();
-    const orderSession = sessions[0];
-
-    console.log(
-      `[TIMING] Session lookup: ${
-        Date.now() - sessionStart
-      } ms`
-    );
-
-    if (!orderSession) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid order link'
-      });
-    }
-
-    if (orderSession.used === true) {
-      return res.status(409).json({
-        success: false,
-        error: 'This order link has already been used'
-      });
-    }
-
-    if (!orderSession.line_user_id) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid order link'
-      });
-    }
-
-    const createdAt =
-      new Date(orderSession.created_at).getTime();
-
-    const age = Date.now() - createdAt;
 
     if (
-      !Number.isFinite(createdAt) ||
-      age < 0 ||
-      age > SESSION_MAX_AGE_MS
-    ) {
-      return res.status(401).json({
-        success: false,
-        error: 'Order link expired'
-      });
-    }
-
-
-    // ==================================================
-    // 2. PREPARE ORDER
-    // ==================================================
-
-    const safePayload = {
-      action: 'createOrder',
-
-      orderId,
-
-      lineName:
-        clean(data.lineName, 100),
-
-      name:
-        clean(data.name, 100),
-
-      phone:
-        clean(data.phone, 40),
-
-      address:
-        clean(data.address, 500),
-
-      pork:
-        numberOrZero(data.pork),
-
-      chicken:
-        numberOrZero(data.chicken),
-
-      delivery:
-        data.delivery === 'pickup'
-          ? 'pickup'
-          : 'shipping',
-
-      payment:
-        data.payment === 'linepay'
-          ? 'linepay'
-          : 'bank',
-
-      productTotal:
-        numberOrZero(data.productTotal),
-
-      shippingFee:
-        numberOrZero(data.shippingFee),
-
-      total:
-        numberOrZero(data.total),
-
-      slip:
-        String(data.slip || '')
-    };
-
-    if (
-      !safePayload.name ||
-      !safePayload.phone ||
-      !safePayload.slip
+      !lineName ||
+      !name ||
+      !/^09\d{8}$/.test(phone)
     ) {
       return res.status(400).json({
         success: false,
-        error: 'Required order information is missing'
+        error: 'Required customer information is missing'
       });
     }
 
+    if (pork + chicken < 1) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please select at least one product'
+      });
+    }
 
-    // ==================================================
-    // 3. PAYMENT SLIP
-    // ==================================================
+    if (
+      delivery === 'shipping' &&
+      !address
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: 'Shipping address is required'
+      });
+    }
 
-    const slipMatch =
-      safePayload.slip.match(
-        /^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/i
-      );
+    const slipMatch = slip.match(
+      /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/i
+    );
 
     if (!slipMatch) {
       return res.status(400).json({
@@ -221,257 +112,115 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const imageType =
-      slipMatch[1].toLowerCase();
+    const slipBytes = Buffer.from(
+      slipMatch[2],
+      'base64'
+    ).length;
 
-    const mimeType =
-      imageType === 'jpg'
-        ? 'image/jpeg'
-        : `image/${imageType}`;
-
-    const extension =
-      imageType === 'jpeg'
-        ? 'jpg'
-        : imageType;
-
-    const slipBuffer =
-      Buffer.from(
-        slipMatch[2],
-        'base64'
-      );
-
-    if (slipBuffer.length > MAX_SLIP_BYTES) {
+    if (
+      slipBytes < 1 ||
+      slipBytes > MAX_SLIP_BYTES
+    ) {
       return res.status(413).json({
         success: false,
         error: 'Payment image is too large'
       });
     }
 
+    // คำนวณยอดใหม่ที่เซิร์ฟเวอร์
+    const productTotal =
+      pork * 300 +
+      chicken * 200;
 
-    // ==================================================
-    // 4. SAVE SLIP TO PRIVATE STORAGE
-    // ==================================================
+    const shippingFee =
+      delivery === 'shipping'
+        ? 200
+        : 0;
 
-    const storageStart = Date.now();
+    const total =
+      productTotal +
+      shippingFee;
 
-    const safeFileOrderId =
-      orderId.replace(
-        /[^A-Za-z0-9_-]/g,
-        ''
-      );
+    const safePayload = {
+      action: 'createOrder',
+      orderId,
+      lineName,
+      name,
+      phone,
 
-    const slipPath =
-      `${safeFileOrderId}-${Date.now()}.${extension}`;
+      address:
+        delivery === 'shipping'
+          ? address
+          : '工作室自取',
 
-    const uploadResponse = await fetch(
-      `${SUPABASE_URL}/storage/v1/object/` +
-      `${STORAGE_BUCKET}/` +
-      `${encodeURIComponent(slipPath)}`,
+      pork,
+      chicken,
+      delivery,
+      payment,
+      productTotal,
+      shippingFee,
+      total,
+      slip
+    };
+
+    const orderResponse = await fetch(
+      ORDER_APPS_SCRIPT,
       {
         method: 'POST',
 
         headers: {
-          ...supabaseHeaders(),
-
-          'Content-Type': mimeType,
-
-          'x-upsert': 'false'
+          'Content-Type':
+            'text/plain;charset=utf-8'
         },
 
-        body: slipBuffer
+        body: JSON.stringify(safePayload),
+        redirect: 'follow',
+        signal: AbortSignal.timeout(55000)
       }
     );
 
-    if (!uploadResponse.ok) {
+    const responseText =
+      await orderResponse.text();
 
-      const uploadError =
-        await uploadResponse.text();
+    let orderResult = null;
 
+    try {
+      orderResult =
+        JSON.parse(responseText);
+    } catch (_) {}
+
+    if (
+      !orderResponse.ok ||
+      !orderResult ||
+      orderResult.success !== true
+    ) {
       console.error(
-        'Storage upload failed:',
-        uploadResponse.status,
-        uploadError.slice(0, 200)
+        'Apps Script order error:',
+        orderResponse.status,
+        String(
+          orderResult?.message ||
+          'Invalid response'
+        ).slice(0, 200)
       );
 
-      throw new Error(
-        'Payment image could not be stored'
-      );
+      return res.status(502).json({
+        success: false,
+        error: 'Order could not be saved'
+      });
     }
-
-    console.log(
-      `[TIMING] Storage upload: ${
-        Date.now() - storageStart
-      } ms`
-    );
-
-
-    // ==================================================
-    // 5. SAVE ORDER TO SUPABASE
-    //
-    // Once this succeeds, the order is safely stored.
-    // ==================================================
-
-    const databaseStart = Date.now();
-
-    const databaseResponse = await fetch(
-      `${SUPABASE_URL}/rest/v1/orders`,
-      {
-        method: 'POST',
-
-        headers: {
-          ...supabaseHeaders(),
-
-          'Content-Type': 'application/json',
-
-          Prefer: 'return=minimal'
-        },
-
-        body: JSON.stringify({
-          order_id: orderId,
-
-          line_user_id:
-            orderSession.line_user_id,
-
-          line_name:
-            safePayload.lineName,
-
-          customer_name:
-            safePayload.name,
-
-          phone:
-            safePayload.phone,
-
-          address:
-            safePayload.address,
-
-          pork:
-            safePayload.pork,
-
-          chicken:
-            safePayload.chicken,
-
-          delivery:
-            safePayload.delivery,
-
-          payment:
-            safePayload.payment,
-
-          product_total:
-            safePayload.productTotal,
-
-          shipping_fee:
-            safePayload.shippingFee,
-
-          total:
-            safePayload.total,
-
-          slip_path:
-            slipPath,
-
-          synced_to_sheet:
-            false,
-
-          line_sent:
-            false
-        })
-      }
-    );
-
-    if (!databaseResponse.ok) {
-
-      const databaseError =
-        await databaseResponse.text();
-
-      console.error(
-        'Order database failed:',
-        databaseResponse.status,
-        databaseError.slice(0, 200)
-      );
-
-      await deleteStorageFile(
-        slipPath
-      ).catch(() => {});
-
-      if (databaseResponse.status === 409) {
-        return res.status(409).json({
-          success: false,
-          error: 'This order has already been submitted'
-        });
-      }
-
-      throw new Error(
-        'Order could not be stored'
-      );
-    }
-
-    console.log(
-      `[TIMING] Supabase order insert: ${
-        Date.now() - databaseStart
-      } ms`
-    );
-
-
-    // ==================================================
-    // 6. BACKGROUND
-    //
-    // IMPORTANT:
-    // Browser does NOT wait for:
-    // - Google
-    // - LINE
-    // - session update
-    //
-    // These 3 start concurrently.
-    // ==================================================
-
-    waitUntil(
-      processOrderInBackground({
-        orderId,
-
-        lineUserId:
-          orderSession.line_user_id,
-
-        payload:
-          safePayload,
-
-        slipPath,
-
-        mimeType,
-
-        session
-      })
-    );
-
-
-    // ==================================================
-    // 7. CUSTOMER RESPONSE
-    // ==================================================
-
-    console.log(
-      `[TIMING] CUSTOMER RESPONSE: ${
-        Date.now() - totalStart
-      } ms`
-    );
 
     return res.status(200).json({
       success: true,
       orderId
     });
 
-
   } catch (error) {
-
     console.error(
       'Order submit error:',
       String(
         error?.message ||
         'unknown'
-      )
-    );
-
-    console.log(
-      `[TIMING] FAILED: ${
-        Date.now() - totalStart
-      } ms`
+      ).slice(0, 200)
     );
 
     return res.status(500).json({
@@ -482,593 +231,32 @@ module.exports = async function handler(req, res) {
   }
 };
 
-
-// ======================================================
-// BACKGROUND
-// ======================================================
-
-async function processOrderInBackground({
-  orderId,
-  lineUserId,
-  payload,
-  slipPath,
-  mimeType,
-  session
-}) {
-  const start = Date.now();
-
-  /*
-    Google, LINE and session update start
-    at the same time.
-  */
-
-  const results =
-    await Promise.allSettled([
-
-      syncGoogleOrder({
-        payload,
-        slipPath,
-        mimeType
-      }),
-
-      sendLineOrderConfirmation(
-        lineUserId,
-        payload
-      ),
-
-      markSessionUsed(
-        session
-      )
-    ]);
-
-
-  const googleResult = results[0];
-  const lineResult = results[1];
-  const sessionResult = results[2];
-
-
-  // ====================================================
-  // GOOGLE RESULT
-  // ====================================================
-
-  const sheetSuccess =
-    googleResult.status === 'fulfilled';
-
-  if (!sheetSuccess) {
-
-    console.error(
-      '[BACKGROUND] GOOGLE FAILED:',
-      String(
-        googleResult.reason?.message ||
-        'unknown'
-      )
-    );
-  }
-
-
-  // ====================================================
-  // LINE RESULT
-  // ====================================================
-
-  const lineSuccess =
-    lineResult.status === 'fulfilled';
-
-  if (!lineSuccess) {
-
-    console.error(
-      '[BACKGROUND] LINE FAILED:',
-      String(
-        lineResult.reason?.message ||
-        'unknown'
-      )
-    );
-  }
-
-
-  // ====================================================
-  // SESSION RESULT
-  // ====================================================
-
-  if (
-    sessionResult.status === 'rejected'
-  ) {
-
-    console.error(
-      '[BACKGROUND] SESSION UPDATE FAILED:',
-      String(
-        sessionResult.reason?.message ||
-        'unknown'
-      )
-    );
-  }
-
-
-  // ====================================================
-  // UPDATE ORDER STATUS
-  // ====================================================
-
-  try {
-
-    await updateOrderStatus(
-      orderId,
-      {
-        synced_to_sheet:
-          sheetSuccess,
-
-        line_sent:
-          lineSuccess
-      }
-    );
-
-  } catch (error) {
-
-    console.error(
-      '[BACKGROUND] STATUS UPDATE FAILED:',
-      String(
-        error?.message ||
-        'unknown'
-      )
-    );
-  }
-
-
-  // ====================================================
-  // CLEAN TEMP STORAGE
-  //
-  // Only delete Supabase copy if Google succeeded.
-  // ====================================================
-
-  if (sheetSuccess) {
-
-    try {
-
-      const deleted =
-        await deleteStorageFile(
-          slipPath
-        );
-
-      if (deleted) {
-
-        await updateOrderStatus(
-          orderId,
-          {
-            slip_path: null
-          }
-        );
-      }
-
-    } catch (error) {
-
-      console.error(
-        '[BACKGROUND] STORAGE CLEANUP FAILED:',
-        String(
-          error?.message ||
-          'unknown'
-        )
-      );
-    }
-  }
-
-
-  console.log(
-    `[BACKGROUND] COMPLETE: ${
-      Date.now() - start
-    } ms | sheet=${sheetSuccess} | line=${lineSuccess}`
-  );
-}
-
-
-// ======================================================
-// GOOGLE
-// ======================================================
-
-async function syncGoogleOrder({
-  payload,
-  slipPath,
-  mimeType
-}) {
-  const start = Date.now();
-
-  // Download temporary private slip
-
-  const downloadResponse = await fetch(
-    `${SUPABASE_URL}/storage/v1/object/authenticated/` +
-    `${STORAGE_BUCKET}/` +
-    `${encodeURIComponent(slipPath)}`,
-    {
-      headers:
-        supabaseHeaders()
-    }
-  );
-
-  if (!downloadResponse.ok) {
-
-    const errorText =
-      await downloadResponse.text();
-
-    throw new Error(
-      `Storage download HTTP ${downloadResponse.status}: ` +
-      errorText.slice(0, 300)
-    );
-  }
-
-  const imageBuffer =
-    Buffer.from(
-      await downloadResponse.arrayBuffer()
-    );
-
-  const slipDataUrl =
-    `data:${mimeType};base64,` +
-    imageBuffer.toString('base64');
-
-
-  // Send to Apps Script
-
-  const appsPayload = {
-    ...payload,
-    slip: slipDataUrl
-  };
-
-  const orderResponse = await fetch(
-    ORDER_APPS_SCRIPT,
-    {
-      method: 'POST',
-
-      headers: {
-        'Content-Type':
-          'text/plain;charset=utf-8'
-      },
-
-      body:
-        JSON.stringify(appsPayload),
-
-      redirect:
-        'follow'
-    }
-  );
-
-  const orderText =
-    await orderResponse.text();
-
-  let orderResult = null;
-
-  try {
-    orderResult =
-      JSON.parse(orderText);
-  } catch (_) {}
-
-
-  if (
-    !orderResponse.ok ||
-    !orderResult ||
-    orderResult.success !== true
-  ) {
-
-    const message =
-      orderResult &&
-      orderResult.message
-
-        ? String(
-            orderResult.message
-          ).slice(0, 300)
-
-        : 'Invalid Apps Script response';
-
-    throw new Error(
-      `Google order failed - HTTP ${orderResponse.status} - ${message}`
-    );
-  }
-
-
-  console.log(
-    `[BACKGROUND] Google Sheet + Drive: ${
-      Date.now() - start
-    } ms`
-  );
-
-  return true;
-}
-
-
-// ======================================================
-// LINE BACKGROUND JOB
-// ======================================================
-
-async function sendLineOrderConfirmation(
-  lineUserId,
-  payload
-) {
-  const start = Date.now();
-
-  const accessToken =
-    await getLineAccessToken();
-
-  await pushOrderConfirmation(
-    accessToken,
-    lineUserId,
-    payload
-  );
-
-  console.log(
-    `[BACKGROUND] LINE: ${
-      Date.now() - start
-    } ms`
-  );
-
-  return true;
-}
-
-
-// ======================================================
-// SESSION BACKGROUND JOB
-// ======================================================
-
-async function markSessionUsed(
-  session
-) {
-  const start = Date.now();
-
-  const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/order_sessions` +
-    `?token=eq.${encodeURIComponent(session)}` +
-    `&used=eq.false`,
-    {
-      method: 'PATCH',
-
-      headers: {
-        ...supabaseHeaders(),
-
-        'Content-Type':
-          'application/json',
-
-        Prefer:
-          'return=minimal'
-      },
-
-      body: JSON.stringify({
-        used: true
-      })
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Session update HTTP ${response.status}`
-    );
-  }
-
-  console.log(
-    `[BACKGROUND] Session update: ${
-      Date.now() - start
-    } ms`
-  );
-
-  return true;
-}
-
-
-// ======================================================
-// UPDATE ORDER STATUS
-// ======================================================
-
-async function updateOrderStatus(
-  orderId,
-  values
-) {
-  const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/orders` +
-    `?order_id=eq.${encodeURIComponent(orderId)}`,
-    {
-      method: 'PATCH',
-
-      headers: {
-        ...supabaseHeaders(),
-
-        'Content-Type':
-          'application/json',
-
-        Prefer:
-          'return=minimal'
-      },
-
-      body:
-        JSON.stringify(values)
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Order status update HTTP ${response.status}`
-    );
-  }
-}
-
-
-// ======================================================
-// STORAGE DELETE
-// ======================================================
-
-async function deleteStorageFile(
-  slipPath
-) {
-  const response = await fetch(
-    `${SUPABASE_URL}/storage/v1/object/` +
-    `${STORAGE_BUCKET}/` +
-    `${encodeURIComponent(slipPath)}`,
-    {
-      method: 'DELETE',
-
-      headers:
-        supabaseHeaders()
-    }
-  );
-
-  if (!response.ok) {
-
-    console.error(
-      'Storage cleanup failed:',
-      response.status
-    );
-
-    return false;
-  }
-
-  return true;
-}
-
-
-// ======================================================
-// LINE TOKEN
-// ======================================================
-
-async function getLineAccessToken() {
-  const params =
-    new URLSearchParams({
-      grant_type:
-        'client_credentials',
-
-      client_id:
-        LINE_CHANNEL_ID,
-
-      client_secret:
-        LINE_CHANNEL_SECRET
-    });
-
-  const response = await fetch(
-    'https://api.line.me/v2/oauth/accessToken',
-    {
-      method: 'POST',
-
-      headers: {
-        'Content-Type':
-          'application/x-www-form-urlencoded'
-      },
-
-      body:
-        params.toString()
-    }
-  );
-
-  const result =
-    await response.json();
-
-  if (
-    !response.ok ||
-    !result.access_token
-  ) {
-    throw new Error(
-      `LINE token HTTP ${response.status}`
-    );
-  }
-
-  return result.access_token;
-}
-
-
-// ======================================================
-// LINE PUSH
-// ======================================================
-
-async function pushOrderConfirmation(
-  accessToken,
-  userId,
-  data
-) {
-  const delivery =
-    data.delivery === 'shipping'
-      ? '黑貓冷凍宅配'
-      : '台中工作室自取';
-
-  const total =
-    Number(
-      data.total || 0
-    ).toLocaleString('en-US');
-
-  const text =
-    `🐘 泰泰烤豬串\n\n` +
-    `已收到您的訂單！\n` +
-    `訂單編號：${data.orderId}\n` +
-    `訂單金額：NT$${total}\n` +
-    `配送方式：${delivery}\n\n` +
-    `付款證明已收到，店家核對款項後訂單才會正式成立。\n` +
-    `感謝您的訂購 ❤️`;
-
-  const response = await fetch(
-    'https://api.line.me/v2/bot/message/push',
-    {
-      method: 'POST',
-
-      headers: {
-        Authorization:
-          `Bearer ${accessToken}`,
-
-        'Content-Type':
-          'application/json'
-      },
-
-      body: JSON.stringify({
-        to: userId,
-
-        messages: [
-          {
-            type: 'text',
-            text: text
-          }
-        ]
-      })
-    }
-  );
-
-  if (!response.ok) {
-
-    const errorText =
-      await response.text();
-
-    throw new Error(
-      `LINE push HTTP ${response.status}: ` +
-      errorText.slice(0, 300)
-    );
-  }
-}
-
-
-// ======================================================
-// HELPERS
-// ======================================================
-
-function supabaseHeaders() {
-  return {
-    apikey:
-      SUPABASE_SECRET_KEY,
-
-    Authorization:
-      `Bearer ${SUPABASE_SECRET_KEY}`
-  };
-}
-
-
-function clean(
-  value,
-  maxLength
-) {
+function clean(value, maxLength) {
   return String(
     value == null
       ? ''
       : value
   )
     .trim()
-    .slice(
-      0,
-      maxLength
-    );
+    .slice(0, maxLength);
 }
 
+function wholeNumber(
+  value,
+  min,
+  max
+) {
+  const number = Number(value);
 
-function numberOrZero(value) {
-  const number =
-    Number(value);
+  if (!Number.isFinite(number)) {
+    return min;
+  }
 
-  return Number.isFinite(number)
-    ? number
-    : 0;
+  return Math.min(
+    max,
+    Math.max(
+      min,
+      Math.trunc(number)
+    )
+  );
 }
