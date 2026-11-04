@@ -300,7 +300,7 @@ async function sendLineConfirmation(
         productLines.join('\n') + '\n\n' +
         '應付金額：NT$' + total.toLocaleString('en-US') + '\n\n' +
         (linePayPending
-          ? '請點擊下方按鈕前往 LINE Pay，並依照以上金額完成付款。'
+          ? '請點擊下方按鈕前往 LINE Pay，並依照以上金額完成付款。\n\n付款完成後，請將付款成功畫面截圖傳送至本聊天室，以便核對付款，謝謝您！'
           : deliveryText + '\n\n感謝您的訂購！🧡')
     }];
 
