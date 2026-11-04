@@ -1,9 +1,14 @@
+const crypto = require('crypto');
+
 const ORDER_APPS_SCRIPT =
   process.env.ORDER_APPS_SCRIPT_URL ||
   'https://script.google.com/macros/s/AKfycbxAgWawSRlh1PsoVEX5UoU-btb0Ia5pKCMWDNYBq5RzBZJ472PO5MNi7IDLwrrFZzwG/exec';
 
 const MAX_REQUEST_BYTES = 2.8 * 1024 * 1024;
 const MAX_SLIP_BYTES = 1.9 * 1024 * 1024;
+const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID;
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const ORDER_SESSION_SECRET = process.env.ORDER_SESSION_SECRET;
 
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'private, no-store, max-age=0');
@@ -16,9 +21,7 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const contentLength = Number(
-      req.headers['content-length'] || 0
-    );
+    const contentLength = Number(req.headers['content-length'] || 0);
 
     if (contentLength > MAX_REQUEST_BYTES) {
       return res.status(413).json({
@@ -31,6 +34,8 @@ module.exports = async function handler(req, res) {
       typeof req.body === 'string'
         ? JSON.parse(req.body)
         : req.body;
+
+    const lineUserId = openOrderSession(data?.session);
 
     if (
       !data ||
@@ -46,24 +51,12 @@ module.exports = async function handler(req, res) {
     const orderId = clean(data.orderId, 100);
     const lineName = clean(data.lineName, 100);
     const name = clean(data.name, 100);
-
-    const phone = clean(data.phone, 40)
-      .replace(/\D/g, '');
-
+    const phone = clean(data.phone, 40).replace(/\D/g, '');
     const address = clean(data.address, 500);
     const pork = wholeNumber(data.pork, 0, 100);
     const chicken = wholeNumber(data.chicken, 0, 100);
-
-    const delivery =
-      data.delivery === 'pickup'
-        ? 'pickup'
-        : 'shipping';
-
-    const payment =
-      data.payment === 'linepay'
-        ? 'linepay'
-        : 'bank';
-
+    const delivery = data.delivery === 'pickup' ? 'pickup' : 'shipping';
+    const payment = data.payment === 'linepay' ? 'linepay' : 'bank';
     const slip = String(data.slip || '');
 
     if (!/^TT\d{10}$/.test(orderId)) {
@@ -73,11 +66,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    if (
-      !lineName ||
-      !name ||
-      !/^09\d{8}$/.test(phone)
-    ) {
+    if (!lineName || !name || !/^09\d{8}$/.test(phone)) {
       return res.status(400).json({
         success: false,
         error: 'Required customer information is missing'
@@ -91,10 +80,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    if (
-      delivery === 'shipping' &&
-      !address
-    ) {
+    if (delivery === 'shipping' && !address) {
       return res.status(400).json({
         success: false,
         error: 'Shipping address is required'
@@ -112,34 +98,19 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const slipBytes = Buffer.from(
-      slipMatch[2],
-      'base64'
-    ).length;
+    const slipBytes = Buffer.from(slipMatch[2], 'base64').length;
 
-    if (
-      slipBytes < 1 ||
-      slipBytes > MAX_SLIP_BYTES
-    ) {
+    if (slipBytes < 1 || slipBytes > MAX_SLIP_BYTES) {
       return res.status(413).json({
         success: false,
         error: 'Payment image is too large'
       });
     }
 
-    // คำนวณยอดใหม่ที่เซิร์ฟเวอร์
-    const productTotal =
-      pork * 300 +
-      chicken * 200;
-
-    const shippingFee =
-      delivery === 'shipping'
-        ? 200
-        : 0;
-
-    const total =
-      productTotal +
-      shippingFee;
+    // Recalculate every amount on the server. Do not trust totals from the browser.
+    const productTotal = pork * 300 + chicken * 200;
+    const shippingFee = delivery === 'shipping' ? 200 : 0;
+    const total = productTotal + shippingFee;
 
     const safePayload = {
       action: 'createOrder',
@@ -147,12 +118,7 @@ module.exports = async function handler(req, res) {
       lineName,
       name,
       phone,
-
-      address:
-        delivery === 'shipping'
-          ? address
-          : '工作室自取',
-
+      address: delivery === 'shipping' ? address : '工作室自取',
       pork,
       chicken,
       delivery,
@@ -163,30 +129,21 @@ module.exports = async function handler(req, res) {
       slip
     };
 
-    const orderResponse = await fetch(
-      ORDER_APPS_SCRIPT,
-      {
-        method: 'POST',
+    const orderResponse = await fetch(ORDER_APPS_SCRIPT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8'
+      },
+      body: JSON.stringify(safePayload),
+      redirect: 'follow',
+      signal: AbortSignal.timeout(55000)
+    });
 
-        headers: {
-          'Content-Type':
-            'text/plain;charset=utf-8'
-        },
-
-        body: JSON.stringify(safePayload),
-        redirect: 'follow',
-        signal: AbortSignal.timeout(55000)
-      }
-    );
-
-    const responseText =
-      await orderResponse.text();
-
+    const responseText = await orderResponse.text();
     let orderResult = null;
 
     try {
-      orderResult =
-        JSON.parse(responseText);
+      orderResult = JSON.parse(responseText);
     } catch (_) {}
 
     if (
@@ -197,10 +154,7 @@ module.exports = async function handler(req, res) {
       console.error(
         'Apps Script order error:',
         orderResponse.status,
-        String(
-          orderResult?.message ||
-          'Invalid response'
-        ).slice(0, 200)
+        String(orderResult?.message || 'Invalid response').slice(0, 200)
       );
 
       return res.status(502).json({
@@ -209,54 +163,155 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    let lineNotificationSent = false;
+
+    if (lineUserId) {
+      lineNotificationSent = await sendLineConfirmation(
+        lineUserId,
+        orderId,
+        total
+      );
+    }
+
     return res.status(200).json({
       success: true,
-      orderId
+      orderId,
+      lineNotificationSent
     });
-
   } catch (error) {
     console.error(
       'Order submit error:',
-      String(
-        error?.message ||
-        'unknown'
-      ).slice(0, 200)
+      String(error?.message || 'unknown').slice(0, 200)
     );
 
     return res.status(500).json({
       success: false,
-      error:
-        'Unable to submit order. Please try again.'
+      error: 'Unable to submit order. Please try again.'
     });
   }
 };
 
 function clean(value, maxLength) {
-  return String(
-    value == null
-      ? ''
-      : value
-  )
+  return String(value == null ? '' : value)
     .trim()
     .slice(0, maxLength);
 }
 
-function wholeNumber(
-  value,
-  min,
-  max
-) {
+function wholeNumber(value, min, max) {
   const number = Number(value);
 
   if (!Number.isFinite(number)) {
     return min;
   }
 
-  return Math.min(
-    max,
-    Math.max(
-      min,
-      Math.trunc(number)
-    )
+  return Math.min(max, Math.max(min, Math.trunc(number)));
+}
+
+function openOrderSession(token) {
+  if (!ORDER_SESSION_SECRET || typeof token !== 'string') {
+    return null;
+  }
+
+  const parts = token.split('.');
+
+  if (parts.length !== 3) {
+    return null;
+  }
+
+  try {
+    const iv = Buffer.from(parts[0], 'base64url');
+    const tag = Buffer.from(parts[1], 'base64url');
+    const encrypted = Buffer.from(parts[2], 'base64url');
+    const key = crypto
+      .createHash('sha256')
+      .update(ORDER_SESSION_SECRET)
+      .digest();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+
+    decipher.setAuthTag(tag);
+
+    const payload = JSON.parse(
+      Buffer.concat([
+        decipher.update(encrypted),
+        decipher.final()
+      ]).toString('utf8')
+    );
+
+    if (
+      !payload ||
+      !/^U[0-9a-f]{32}$/i.test(String(payload.userId || '')) ||
+      !Number.isFinite(payload.expiresAt) ||
+      Date.now() > payload.expiresAt
+    ) {
+      return null;
+    }
+
+    return payload.userId;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function sendLineConfirmation(userId, orderId, total) {
+  if (!LINE_CHANNEL_ID || !LINE_CHANNEL_SECRET) {
+    return false;
+  }
+
+  try {
+    const accessToken = await getLineAccessToken();
+    const response = await fetch(
+      'https://api.line.me/v2/bot/message/push',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + accessToken,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          to: userId,
+          messages: [{
+            type: 'text',
+            text:
+              '✅ 已收到您的訂單\n' +
+              '訂單編號：' + orderId + '\n' +
+              '訂單金額：NT$' + total.toLocaleString('en-US') + '\n\n' +
+              '付款證明已送出，店家核對款項後，訂單才會正式成立。'
+          }]
+        })
+      }
+    );
+
+    return response.ok;
+  } catch (error) {
+    console.error(
+      'LINE confirmation error:',
+      String(error?.message || 'unknown').slice(0, 160)
+    );
+    return false;
+  }
+}
+
+async function getLineAccessToken() {
+  const params = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: LINE_CHANNEL_ID,
+    client_secret: LINE_CHANNEL_SECRET
+  });
+  const response = await fetch(
+    'https://api.line.me/v2/oauth/accessToken',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: params.toString()
+    }
   );
+  const result = await response.json();
+
+  if (!response.ok || !result.access_token) {
+    throw new Error('Unable to obtain LINE access token');
+  }
+
+  return result.access_token;
 }
