@@ -160,10 +160,10 @@ async function replyLineOrderLink(accessToken, replyToken, orderLink) {
         replyToken,
         messages: [{
           type: 'template',
-          altText: '線上預訂',
+          altText: '📦線上預訂',
           template: {
             type: 'buttons',
-            title: '泰泰烤豬串｜線上預訂',
+            title: '線上預訂',
             text: '請點擊下方按鈕填寫訂單\n連結限本人使用，有效期限 24 小時',
             actions: [{
               type: 'uri',
