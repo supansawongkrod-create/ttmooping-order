@@ -1,243 +1,172 @@
 const crypto = require('crypto');
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const ORDER_SESSION_SECRET = process.env.ORDER_SESSION_SECRET;
-
-const ORDER_URL = 'https://ttmooping-order.vercel.app';
+const ORDER_URL = 'https://ttmooping-order.vercel.app/';
+const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+    return res.status(405).json({ success: false });
   }
 
   try {
-    // -----------------------------
-    // 1. Verify LINE webhook
-    // -----------------------------
-    if (!LINE_CHANNEL_SECRET) {
-      throw new Error('LINE_CHANNEL_SECRET missing');
+    if (
+      !LINE_CHANNEL_ID ||
+      !LINE_CHANNEL_SECRET ||
+      !ORDER_SESSION_SECRET
+    ) {
+      throw new Error('Required environment variables missing');
     }
 
-    const signature = req.headers['x-line-signature'];
-
+    const signature = String(req.headers['x-line-signature'] || '');
     const rawBody =
       typeof req.body === 'string'
         ? req.body
-        : JSON.stringify(req.body);
-
+        : JSON.stringify(req.body || {});
     const expectedSignature = crypto
       .createHmac('sha256', LINE_CHANNEL_SECRET)
       .update(rawBody)
       .digest('base64');
-
-    if (!signature) {
-      return res.status(401).json({ error: 'Missing LINE signature' });
-    }
-
     const signatureBuffer = Buffer.from(signature);
     const expectedBuffer = Buffer.from(expectedSignature);
 
     if (
+      !signature ||
       signatureBuffer.length !== expectedBuffer.length ||
       !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)
     ) {
-      return res.status(401).json({ error: 'Invalid signature' });
+      return res.status(401).json({ success: false });
     }
 
     const body =
       typeof req.body === 'string'
         ? JSON.parse(req.body)
         : req.body;
+    const events = Array.isArray(body?.events) ? body.events : [];
 
-    const events = body?.events || [];
-
-    // LINE webhook verification
     if (events.length === 0) {
       return res.status(200).json({ success: true });
     }
 
-    // -----------------------------
-    // 2. Handle LINE events
-    // -----------------------------
+    let accessToken = null;
+
     for (const event of events) {
-      const userId = event?.source?.userId;
+      if (
+        event?.type !== 'message' ||
+        event?.message?.type !== 'text' ||
+        !event?.replyToken
+      ) {
+        continue;
+      }
 
-      if (!userId) continue;
-
-      console.log('EVENT_TYPE:', event.type);
+      const text = String(event.message.text || '').trim();
+      const userId = String(event?.source?.userId || '');
 
       if (
-        event.type === 'message' &&
-        event.message?.type === 'text' &&
-        event.message.text.trim().toLowerCase() === 'testorder'
+        !['線上預訂', 'testorder'].includes(text.toLowerCase()) ||
+        !/^U[0-9a-f]{32}$/i.test(userId)
       ) {
-        console.log('TEST_ORDER_REQUEST');
-
-        const token = createSessionToken();
-
-        // Save token -> LINE user ID
-        await saveOrderSession(token, userId);
-
-        const orderLink =
-          `${ORDER_URL}/?session=${encodeURIComponent(token)}`;
-
-        // Get temporary LINE access token
-        const accessToken = await getLineAccessToken();
-
-        // Reply to the SAME person
-        await replyLineMessage(
-          accessToken,
-          event.replyToken,
-          orderLink
-        );
-
-        console.log('TEST_ORDER_LINK_SENT');
+        continue;
       }
+
+      if (!accessToken) {
+        accessToken = await getLineAccessToken();
+      }
+
+      const session = createOrderSession(userId);
+      const orderLink = ORDER_URL + '?session=' + encodeURIComponent(session);
+
+      await replyLineMessage(
+        accessToken,
+        event.replyToken,
+        '泰泰烤豬串｜線上預訂\n\n' +
+          '請點擊下方連結填寫訂單：\n' +
+          orderLink + '\n\n' +
+          '此連結限本人使用，有效期限為 24 小時。'
+      );
     }
 
     return res.status(200).json({ success: true });
-
   } catch (error) {
-    console.error('Webhook error:', error);
-    return res.status(500).json({
-      success: false,
-      error: String(error.message || error)
-    });
+    console.error(
+      'LINE webhook error:',
+      String(error?.message || 'unknown').slice(0, 200)
+    );
+    return res.status(500).json({ success: false });
   }
 };
 
-
-// ======================================================
-// Create random order session token
-// ======================================================
-
-function createSessionToken() {
-  const random = crypto.randomBytes(24).toString('hex');
-
-  return crypto
-    .createHmac('sha256', ORDER_SESSION_SECRET)
-    .update(random + Date.now())
-    .digest('hex');
-}
-
-
-// ======================================================
-// Save session to Supabase
-// ======================================================
-
-async function saveOrderSession(token, userId) {
-  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
-    throw new Error('Supabase environment variables missing');
-  }
-
-  const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/order_sessions`,
-    {
-      method: 'POST',
-      headers: {
-        apikey: SUPABASE_SECRET_KEY,
-        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal'
-      },
-      body: JSON.stringify({
-        token: token,
-        line_user_id: userId,
-        used: false
-      })
-    }
+function createOrderSession(userId) {
+  const key = crypto
+    .createHash('sha256')
+    .update(ORDER_SESSION_SECRET)
+    .digest();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const payload = Buffer.from(
+    JSON.stringify({
+      userId,
+      expiresAt: Date.now() + SESSION_LIFETIME_MS
+    }),
+    'utf8'
   );
+  const encrypted = Buffer.concat([
+    cipher.update(payload),
+    cipher.final()
+  ]);
+  const tag = cipher.getAuthTag();
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(
-      `Supabase session error ${response.status}: ${text}`
-    );
-  }
+  return [
+    iv.toString('base64url'),
+    tag.toString('base64url'),
+    encrypted.toString('base64url')
+  ].join('.');
 }
-
-
-// ======================================================
-// Get LINE Channel Access Token
-// ======================================================
 
 async function getLineAccessToken() {
-  if (!LINE_CHANNEL_ID || !LINE_CHANNEL_SECRET) {
-    throw new Error('LINE credentials missing');
-  }
-
-  const params = new URLSearchParams();
-
-  params.append('grant_type', 'client_credentials');
-  params.append('client_id', LINE_CHANNEL_ID);
-  params.append('client_secret', LINE_CHANNEL_SECRET);
-
+  const params = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: LINE_CHANNEL_ID,
+    client_secret: LINE_CHANNEL_SECRET
+  });
   const response = await fetch(
     'https://api.line.me/v2/oauth/accessToken',
     {
       method: 'POST',
       headers: {
-        'Content-Type':
-          'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded'
       },
       body: params.toString()
     }
   );
-
   const result = await response.json();
 
   if (!response.ok || !result.access_token) {
-    throw new Error(
-      `LINE token error ${response.status}: ${JSON.stringify(result)}`
-    );
+    throw new Error('Unable to obtain LINE access token');
   }
 
   return result.access_token;
 }
 
-
-// ======================================================
-// Reply with test order link
-// ======================================================
-
-async function replyLineMessage(
-  accessToken,
-  replyToken,
-  orderLink
-) {
+async function replyLineMessage(accessToken, replyToken, text) {
   const response = await fetch(
     'https://api.line.me/v2/bot/message/reply',
     {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${accessToken}`,
+        Authorization: 'Bearer ' + accessToken,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        replyToken: replyToken,
-
-        messages: [
-          {
-            type: 'text',
-
-            text:
-              '泰泰烤豬串｜測試訂購\n\n' +
-              '請點擊下方連結進入測試訂購頁：\n' +
-              orderLink
-          }
-        ]
+        replyToken,
+        messages: [{ type: 'text', text }]
       })
     }
   );
 
   if (!response.ok) {
-    const text = await response.text();
-
-    throw new Error(
-      `LINE reply error ${response.status}: ${text}`
-    );
+    throw new Error('Unable to send LINE reply');
   }
 }
