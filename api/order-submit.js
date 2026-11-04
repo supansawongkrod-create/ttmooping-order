@@ -9,6 +9,7 @@ const MAX_SLIP_BYTES = 1.9 * 1024 * 1024;
 const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const ORDER_SESSION_SECRET = process.env.ORDER_SESSION_SECRET;
+const TRACKING_URL = 'https://ttmooping-ordertracking.vercel.app/';
 
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'private, no-store, max-age=0');
@@ -169,7 +170,10 @@ module.exports = async function handler(req, res) {
       lineNotificationSent = await sendLineConfirmation(
         lineUserId,
         orderId,
-        total
+        total,
+        pork,
+        chicken,
+        delivery
       );
     }
 
@@ -252,13 +256,63 @@ function openOrderSession(token) {
   }
 }
 
-async function sendLineConfirmation(userId, orderId, total) {
+async function sendLineConfirmation(
+  userId,
+  orderId,
+  total,
+  pork,
+  chicken,
+  delivery
+) {
   if (!LINE_CHANNEL_ID || !LINE_CHANNEL_SECRET) {
     return false;
   }
 
   try {
     const accessToken = await getLineAccessToken();
+    const productLines = [];
+
+    if (pork > 0) {
+      productLines.push('・泰泰烤豬串 × ' + pork + ' 包');
+    }
+
+    if (chicken > 0) {
+      productLines.push('・泰國生烤雞翅 × ' + chicken + ' 包');
+    }
+
+    const deliveryText =
+      delivery === 'shipping'
+        ? '📦 商品預計於訂購後 7 天內出貨，寄出後約 1–3 個工作天送達。'
+        : '📍 請透過官方 LINE 預約工作室自取時間。';
+
+    const messages = [{
+      type: 'text',
+      text:
+        '✅ 訂單已收到\n\n' +
+        '訂單編號：' + orderId + '\n\n' +
+        '訂購內容：\n' +
+        productLines.join('\n') + '\n\n' +
+        '訂單金額：NT$' + total.toLocaleString('en-US') + '\n\n' +
+        deliveryText + '\n\n' +
+        '感謝您的訂購！🧡'
+    }];
+
+    if (delivery === 'shipping') {
+      messages.push({
+        type: 'template',
+        altText: '查詢宅配單號',
+        template: {
+          type: 'buttons',
+          text: '商品寄出後，可使用手機號碼查詢宅配單號。',
+          actions: [{
+            type: 'uri',
+            label: '查詢宅配單號',
+            uri: TRACKING_URL
+          }]
+        }
+      });
+    }
+
     const response = await fetch(
       'https://api.line.me/v2/bot/message/push',
       {
@@ -269,14 +323,7 @@ async function sendLineConfirmation(userId, orderId, total) {
         },
         body: JSON.stringify({
           to: userId,
-          messages: [{
-            type: 'text',
-            text:
-              '✅ 已收到您的訂單\n' +
-              '訂單編號：' + orderId + '\n' +
-              '訂單金額：NT$' + total.toLocaleString('en-US') + '\n\n' +
-              '付款證明已送出，店家核對款項後，訂單才會正式成立。'
-          }]
+          messages
         })
       }
     );
