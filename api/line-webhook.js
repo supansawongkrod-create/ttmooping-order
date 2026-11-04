@@ -160,7 +160,7 @@ async function replyLineOrderLink(accessToken, replyToken, orderLink) {
         replyToken,
         messages: [{
           type: 'template',
-          altText: '泰泰烤豬串｜線上預訂',
+          altText: '線上預訂',
           template: {
             type: 'buttons',
             title: '泰泰烤豬串｜線上預訂',
