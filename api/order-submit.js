@@ -10,6 +10,7 @@ const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const ORDER_SESSION_SECRET = process.env.ORDER_SESSION_SECRET;
 const TRACKING_URL = 'https://ttmooping-ordertracking.vercel.app/';
+const LINE_PAY_URL = 'https://reurl.cc/GgNgvA';
 
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'private, no-store, max-age=0');
@@ -88,24 +89,26 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const slipMatch = slip.match(
-      /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/i
-    );
+    if (payment === 'bank' || slip) {
+      const slipMatch = slip.match(
+        /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/i
+      );
 
-    if (!slipMatch) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid payment image'
-      });
-    }
+      if (!slipMatch) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid payment image'
+        });
+      }
 
-    const slipBytes = Buffer.from(slipMatch[2], 'base64').length;
+      const slipBytes = Buffer.from(slipMatch[2], 'base64').length;
 
-    if (slipBytes < 1 || slipBytes > MAX_SLIP_BYTES) {
-      return res.status(413).json({
-        success: false,
-        error: 'Payment image is too large'
-      });
+      if (slipBytes < 1 || slipBytes > MAX_SLIP_BYTES) {
+        return res.status(413).json({
+          success: false,
+          error: 'Payment image is too large'
+        });
+      }
     }
 
     // Recalculate every amount on the server. Do not trust totals from the browser.
@@ -173,7 +176,8 @@ module.exports = async function handler(req, res) {
         total,
         pork,
         chicken,
-        delivery
+        delivery,
+        payment
       );
     }
 
@@ -262,7 +266,8 @@ async function sendLineConfirmation(
   total,
   pork,
   chicken,
-  delivery
+  delivery,
+  payment
 ) {
   if (!LINE_CHANNEL_ID || !LINE_CHANNEL_SECRET) {
     return false;
@@ -285,19 +290,37 @@ async function sendLineConfirmation(
         ? '📦 商品預計於訂購後 7 天內出貨，寄出後約 1–3 個工作天送達。'
         : '📍 請透過官方 LINE 預約工作室自取時間。';
 
+    const linePayPending = payment === 'linepay';
     const messages = [{
       type: 'text',
       text:
-        '✅ 訂單已收到\n\n' +
+        (linePayPending ? '✅ 訂單資料已確認\n\n' : '✅ 訂單已收到\n\n') +
         '訂單編號：' + orderId + '\n\n' +
         '訂購內容：\n' +
         productLines.join('\n') + '\n\n' +
-        '訂單金額：NT$' + total.toLocaleString('en-US') + '\n\n' +
-        deliveryText + '\n\n' +
-        '感謝您的訂購！🧡'
+        '應付金額：NT$' + total.toLocaleString('en-US') + '\n\n' +
+        (linePayPending
+          ? '請點擊下方按鈕前往 LINE Pay，並依照以上金額完成付款。'
+          : deliveryText + '\n\n感謝您的訂購！🧡')
     }];
 
-    if (delivery === 'shipping') {
+    if (linePayPending) {
+      messages.push({
+        type: 'template',
+        altText: '前往 LINE Pay 付款',
+        template: {
+          type: 'buttons',
+          text: '應付 NT$' + total.toLocaleString('en-US') + '，付款後訂單才正式成立。',
+          actions: [{
+            type: 'uri',
+            label: '前往 LINE Pay',
+            uri: LINE_PAY_URL
+          }]
+        }
+      });
+    }
+
+    if (!linePayPending && delivery === 'shipping') {
       messages.push({
         type: 'template',
         altText: '查詢宅配單號',
