@@ -78,13 +78,10 @@ module.exports = async function handler(req, res) {
       const session = createOrderSession(userId);
       const orderLink = ORDER_URL + '?session=' + encodeURIComponent(session);
 
-      await replyLineMessage(
+      await replyLineOrderLink(
         accessToken,
         event.replyToken,
-        '泰泰烤豬串｜線上預訂\n\n' +
-          '請點擊下方連結填寫訂單：\n' +
-          orderLink + '\n\n' +
-          '此連結限本人使用，有效期限為 24 小時。'
+        orderLink
       );
     }
 
@@ -150,7 +147,7 @@ async function getLineAccessToken() {
   return result.access_token;
 }
 
-async function replyLineMessage(accessToken, replyToken, text) {
+async function replyLineOrderLink(accessToken, replyToken, orderLink) {
   const response = await fetch(
     'https://api.line.me/v2/bot/message/reply',
     {
@@ -161,7 +158,20 @@ async function replyLineMessage(accessToken, replyToken, text) {
       },
       body: JSON.stringify({
         replyToken,
-        messages: [{ type: 'text', text }]
+        messages: [{
+          type: 'template',
+          altText: '泰泰烤豬串｜線上預訂',
+          template: {
+            type: 'buttons',
+            title: '泰泰烤豬串｜線上預訂',
+            text: '請點擊下方按鈕填寫訂單\n連結限本人使用，有效期限 24 小時',
+            actions: [{
+              type: 'uri',
+              label: '開始訂購',
+              uri: orderLink
+            }]
+          }
+        }]
       })
     }
   );
