@@ -44,7 +44,9 @@
   border-radius:13px;
   margin:0;
   background:#111;
+  cursor:zoom-in;
 }
+.product-image-viewer{width:min(92vw,720px);max-width:720px;background:#111;border:0;border-radius:18px;padding:12px;overflow:visible}.product-image-viewer::backdrop{background:rgba(0,0,0,.82);backdrop-filter:blur(4px)}.product-image-viewer img{display:block;width:100%;max-height:82vh;object-fit:contain;border-radius:12px}.product-image-close{position:absolute;right:-10px;top:-10px;width:38px;height:38px;border:0;border-radius:50%;background:#fff;color:#201b16;font-size:24px;line-height:1;box-shadow:0 4px 18px rgba(0,0,0,.28)}
 .product>div:not(.counter){
   grid-column:2;
   grid-row:1;
@@ -208,6 +210,7 @@ img, video, canvas, svg, iframe { max-width: 100%; }
     if(new URLSearchParams(location.search).get('resume')==='1')localStorage.setItem(PAY_PENDING_KEY,'1');
     const state={pork:0,chicken:0,delivery:'shipping'};
     const $=id=>document.getElementById(id); const money=n=>'NT$'+n.toLocaleString('en-US');
+    const productImageViewer=document.createElement('dialog');productImageViewer.className='product-image-viewer';productImageViewer.innerHTML='<button type="button" class="product-image-close" aria-label="關閉">×</button><img alt="商品圖片">';document.body.appendChild(productImageViewer);document.querySelectorAll('.product-image').forEach(img=>{img.tabIndex=0;img.setAttribute('role','button');img.setAttribute('aria-label',img.alt+'，點擊查看大圖');const open=()=>{productImageViewer.querySelector('img').src=img.src;productImageViewer.querySelector('img').alt=img.alt;productImageViewer.showModal()};img.addEventListener('click',open);img.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();open()}})});productImageViewer.querySelector('button').onclick=()=>productImageViewer.close();productImageViewer.addEventListener('click',e=>{if(e.target===productImageViewer)productImageViewer.close()});
     const formColumn=$('paymentSection').parentElement;const termsSection=$('sec6').closest('section');formColumn.insertBefore(termsSection,$('paymentSection'));formColumn.appendChild($('paymentSection'));formColumn.appendChild($('slipSection'));
     const paymentSummary=document.createElement('div');paymentSummary.id='paymentOrderSummary';paymentSummary.className='payment-order-summary';$('inlineAmount').insertAdjacentElement('afterend',paymentSummary);
     function totals(){const packs=state.pork+state.chicken;const delivery=state.delivery==='shipping'?(packs===0?0:200):0;return{pork:state.pork*300,chicken:state.chicken*200,delivery,total:state.pork*300+state.chicken*200+delivery}}
